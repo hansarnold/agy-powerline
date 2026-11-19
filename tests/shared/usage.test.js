@@ -15,6 +15,7 @@ const {
   stats,
   loadSqlite,
   decodeMessage,
+  readSessionCostDatabase,
   clearUsageCache,
 } = require("../../src/lib/usage");
 
@@ -45,8 +46,26 @@ function field(number, value) {
 
 const message = (...fields) => Uint8Array.from(fields.flat());
 const timestamp = (ms) => message(field(1, Math.floor(ms / 1000)), field(2, (ms % 1000) * 1e6));
-const usage = ({ input, output, id }) =>
-  message(field(2, input), field(3, output), id ? field(11, id) : []);
+const usage = ({
+  input = 0,
+  output = 0,
+  cacheWrite = 0,
+  cacheRead = 0,
+  reasoning = 0,
+  visible = 0,
+  modelId = 0,
+  id,
+}) =>
+  message(
+    modelId ? field(1, modelId) : [],
+    field(2, input),
+    field(3, output),
+    cacheWrite ? field(4, cacheWrite) : [],
+    cacheRead ? field(5, cacheRead) : [],
+    reasoning ? field(9, reasoning) : [],
+    visible ? field(10, visible) : [],
+    id ? field(11, id) : []
+  );
 
 // gen_metadata.data: chat message (1) with usage (4), retries (17 → 2) and
 // generation info (9 → timestamp in 4).
@@ -339,6 +358,67 @@ async function run() {
       }
     }
     record("truncated, malformed or too deeply nested protobuf is rejected", rejected === 4);
+
+    // Session cost estimation from SQLite (cache_read + thinking + dedup).
+    const costConvId = "11111111-2222-3333-4444-555555555555";
+    const costDbFile = path.join(dir, `${costConvId}.db`);
+    const neonTurn = {
+      input: 100_000,
+      output: 20_000,
+      cacheRead: 2_000_000,
+      reasoning: 10_000,
+      visible: 10_000,
+      id: "resp-neon-1",
+    };
+    makeConversationDb(costDbFile, {
+      gens: [generator(neonTurn, NOW, [neonTurn])],
+      steps: [step(neonTurn, NOW)],
+      mtime: NOW,
+    });
+    const directCost = readSessionCostDatabase(costDbFile, "Gemini 4 Neon (High)");
+    record(
+      "SQLite session cost includes cache_read and thinking tokens without double-counting retries/steps",
+      directCost !== null &&
+        directCost.estimated === true &&
+        Math.abs(directCost.totalUsd - 0.9) < 1e-9,
+      JSON.stringify(directCost)
+    );
+    setConfigDir(install);
+    clearUsageCache();
+    const costCfg = {
+      ...defaultConfig(),
+      layout: "lines",
+      emojis: false,
+      widgets: [{ id: "cost", estimate: true }],
+    };
+    const costPayload = {
+      ...sampleData(),
+      cost: undefined,
+      conversation_id: costConvId,
+      model: { id: "gemini-4-neon-high", display_name: "Gemini 4 Neon (High)" },
+    };
+    const opensBeforeCost = stats.opens;
+    const costRendered1 = inHome(home, () =>
+      stripAnsi(renderStatusline(costPayload, costCfg, { usage: "read" }))
+    );
+    const opensAfterCost1 = stats.opens;
+    const costRendered2 = inHome(home, () =>
+      stripAnsi(renderStatusline(costPayload, costCfg, { usage: "read" }))
+    );
+    record(
+      "live statusline reads SQLite session cost, renders ~$0.90, and caches unchanged DB",
+      costRendered1.includes("~$0.90") &&
+        costRendered2 === costRendered1 &&
+        opensAfterCost1 === opensBeforeCost + 1 &&
+        stats.opens === opensAfterCost1,
+      JSON.stringify({
+        costRendered1,
+        costRendered2,
+        opensBeforeCost,
+        opensAfterCost1,
+        opensAfterCost2: stats.opens,
+      })
+    );
   } catch (err) {
     record("usage suite ran without errors", false, String(err.stack || err));
   } finally {

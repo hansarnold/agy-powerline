@@ -8,7 +8,12 @@ const os = require("os");
 const path = require("path");
 const { formatReset, resetInSeconds, firstText, stripControl } = require("./formatters");
 const { resolveGit, resolveGitDetails } = require("./git");
-const { resolveUsage, conversationsDir } = require("./usage");
+const {
+  resolveUsage,
+  conversationsDir,
+  estimateCostFromTokens,
+  resolveSessionCost,
+} = require("./usage");
 const { isWsl, resolveInstallDir, writeFileAtomic, PRIVATE_FILE_MODE } = require("./paths");
 const { logWarning } = require("./log");
 const { resolveLanguage, t } = require("./i18n");
@@ -179,54 +184,6 @@ function currentUserAndHost() {
     // The host widget hides when the OS cannot provide a name.
   }
   return { username, hostname };
-}
-
-// Approximate API list prices (USD per 1M tokens) used only when the cost
-// widget opts into `"estimate": true` and Antigravity omits `cost` (e.g.
-// subscription plans like Google AI Pro / Ultra). Ordered most-specific first.
-const MODEL_PRICING = [
-  { match: /\bneon\b/i, input: 3.0, output: 15.0 },
-  { match: /\bcarbon\b/i, input: 2.0, output: 10.0 },
-  { match: /\bargon\b/i, input: 2.0, output: 10.0 },
-  { match: /\bhydrogen\b/i, input: 1.5, output: 7.5 },
-  { match: /\borchestrator\b/i, input: 2.0, output: 10.0 },
-  { match: /\b3\.8\s*flash\b|\bflash\b/i, input: 0.75, output: 3.75 },
-  { match: /\bgemini[\s-]*3\b|\bgemini[\s-]*2\.5[\s-]*pro\b/i, input: 2.0, output: 12.0 },
-  { match: /\bclaude[\s-]*opus[\s-]*5\b/i, input: 4.0, output: 20.0 },
-  { match: /\bclaude[\s-]*opus\b/i, input: 5.0, output: 25.0 },
-  { match: /\bclaude[\s-]*sonnet[\s-]*5\b/i, input: 2.0, output: 10.0 },
-  { match: /\bclaude[\s-]*sonnet\b/i, input: 3.0, output: 15.0 },
-  { match: /\bclaude[\s-]*haiku\b/i, input: 0.8, output: 4.0 },
-  { match: /\bgpt[\s-]*oss[\s-]*120b\b/i, input: 0.15, output: 0.6 },
-];
-const DEFAULT_MODEL_PRICING = { input: 2.0, output: 10.0 };
-
-function matchModelPricing(modelName) {
-  const name = String(modelName || "");
-  for (const entry of MODEL_PRICING) {
-    if (entry.match.test(name)) {
-      return entry;
-    }
-  }
-  return DEFAULT_MODEL_PRICING;
-}
-
-function estimateCostFromTokens(modelName, inputTokens, outputTokens) {
-  const input = count(inputTokens);
-  const output = count(outputTokens);
-  if (input <= 0 && output <= 0) {
-    return null;
-  }
-  const pricing = matchModelPricing(modelName);
-  const totalUsd = (input * pricing.input + output * pricing.output) / 1_000_000;
-  if (!Number.isFinite(totalUsd) || totalUsd < 0) {
-    return null;
-  }
-  return {
-    totalUsd,
-    subagentUsd: 0,
-    estimated: true,
-  };
 }
 
 function extractCost(raw) {
@@ -437,6 +394,19 @@ function extractSession(data, config, options = {}) {
     }
   }
 
+  const reportedCost = extractCost(data.cost);
+  const wantsEstimatedCost =
+    !reportedCost &&
+    Boolean(config?.widgets?.some((widget) => widget?.id === "cost" && widget?.estimate));
+  const estimatedCost = wantsEstimatedCost
+    ? resolveSessionCost(data, modelName, { read: options.readUsage === true }) ||
+      estimateCostFromTokens(
+        modelName,
+        inputTokens || count(usage?.input_tokens),
+        outputTokens || count(usage?.output_tokens)
+      )
+    : null;
+
   return {
     lang,
     os: osName,
@@ -480,12 +450,8 @@ function extractSession(data, config, options = {}) {
         : null,
     tasks: Math.floor(count(data.task_count)),
     pendingInputs: Math.floor(count(data.pending_input_count)),
-    cost: extractCost(data.cost),
-    estimatedCost: estimateCostFromTokens(
-      modelName,
-      inputTokens || count(usage?.input_tokens),
-      outputTokens || count(usage?.output_tokens)
-    ),
+    cost: reportedCost,
+    estimatedCost,
     // Left out in the default mode, and with Vim editing off.
     approvalMode: firstText(data.cycle_mode),
     vimMode: firstText(data.vim?.mode),

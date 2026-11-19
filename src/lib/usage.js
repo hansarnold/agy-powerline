@@ -18,6 +18,7 @@ const { logWarning } = require("./log");
 const { writeFileAtomic, PRIVATE_FILE_MODE } = require("./paths");
 
 const USAGE_CACHE_NAME = ".usage-cache.json";
+const SESSION_COST_CACHE_NAME = ".session-cost-cache.json";
 // Reading databases stops for this refresh past this budget; the cache keeps
 // the totals and the rest is read on the next refresh.
 const READ_BUDGET_MS = 100;
@@ -28,10 +29,64 @@ const USAGE_PERIODS = { tokensToday: 1, tokensWeek: 7 };
 const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 8;
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
+const CONVERSATION_ID_PATTERN = /^[0-9a-f-]{8,64}$/i;
+
+// Model ID mapping and token-pricing logic aligned with ccusage's Antigravity
+// adapter (MIT, rust/adapters/antigravity/src/parser.rs) and LiteLLM rates
+// (USD per 1M tokens).
+const MODEL_ID_MAP = {
+  246: "gemini-2.5-pro",
+  312: "gemini-2.5-flash",
+  313: "gemini-2.5-flash-thinking",
+  329: "gemini-2.5-flash-thinking",
+  330: "gemini-2.5-flash-lite",
+  281: "claude-4-sonnet",
+  282: "claude-4-sonnet",
+  290: "claude-4-opus",
+  291: "claude-4-opus",
+  333: "claude-4.5-sonnet",
+  334: "claude-4.5-sonnet",
+  340: "claude-4.5-haiku",
+  341: "claude-4.5-haiku",
+  342: "gpt-oss-120b-medium",
+  1050: "gemini-3.1-flash-lite",
+  1071: "gemini-3.6-flash-high",
+  1072: "gemini-3.6-flash-medium",
+  1073: "gemini-3.6-flash-low",
+  1298: "gemini-3.7-flash-high",
+  1299: "gemini-3.7-flash-medium",
+  1300: "gemini-3.7-flash-low",
+  1318: "gemini-3.8-flash-high",
+  1319: "gemini-3.8-flash-medium",
+  1320: "gemini-3.8-flash-low",
+  1402: "claude-opus-5-5",
+  1417: "gemini-4-argon",
+  1418: "gemini-4-argon",
+  1419: "gemini-4-argon",
+};
+
+const MODEL_PRICING = [
+  { match: /\bneon\b/i, input: 3.0, output: 15.0, cacheRead: 0.15, cacheWrite: 3.0 },
+  { match: /\bcarbon\b/i, input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.0 },
+  { match: /\bargon\b/i, input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.0 },
+  { match: /\bhydrogen\b/i, input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 1.5 },
+  { match: /\borchestrator\b/i, input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.0 },
+  { match: /\b3\.8[\s-]*flash\b|\bflash\b/i, input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0.75 },
+  { match: /\bgemini[\s-]*3\b|\bgemini[\s-]*2\.5[\s-]*pro\b/i, input: 2.0, output: 12.0, cacheRead: 0.2, cacheWrite: 2.0 },
+  { match: /\bclaude[\s-]*opus[\s-]*5[\s.-]*5\b/i, input: 4.0, output: 20.0, cacheRead: 0.2, cacheWrite: 5.0 },
+  { match: /\bclaude[\s-]*opus\b/i, input: 5.0, output: 25.0, cacheRead: 0.5, cacheWrite: 6.25 },
+  { match: /\bclaude[\s-]*sonnet[\s-]*5[\s.-]*5\b/i, input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.5 },
+  { match: /\bclaude[\s-]*sonnet[\s-]*5\b/i, input: 2.0, output: 10.0, cacheRead: 0.2, cacheWrite: 2.5 },
+  { match: /\bclaude[\s-]*sonnet\b/i, input: 3.0, output: 15.0, cacheRead: 0.3, cacheWrite: 3.75 },
+  { match: /\bclaude[\s-]*haiku\b/i, input: 0.8, output: 4.0, cacheRead: 0.08, cacheWrite: 1.0 },
+  { match: /\bgpt[\s-]*oss[\s-]*120b\b/i, input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0.15 },
+];
+const DEFAULT_MODEL_PRICING = { input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.0 };
 
 // Database opens, so tests can check that unchanged files aren't read again.
 const stats = { opens: 0 };
 let memoryCache = null;
+let sessionCostMemoryCache = null;
 let sqlite;
 
 // node:sqlite is built into Node 22.13 / 23.4 and newer. Node 22 prints an
@@ -508,14 +563,335 @@ function resolveUsage(config, { read = false } = {}) {
   }
 }
 
+function matchModelPricing(modelName) {
+  const name = String(modelName || "");
+  for (const entry of MODEL_PRICING) {
+    if (entry.match.test(name)) {
+      return entry;
+    }
+  }
+  return DEFAULT_MODEL_PRICING;
+}
+
+function safeTokenCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 && n <= Number.MAX_SAFE_INTEGER ? n : 0;
+}
+
+function estimateCostFromTokens(
+  modelName,
+  inputTokens,
+  outputTokens,
+  cacheReadTokens = 0,
+  cacheWriteTokens = 0
+) {
+  const input = safeTokenCount(inputTokens);
+  const output = safeTokenCount(outputTokens);
+  const cacheRead = safeTokenCount(cacheReadTokens);
+  const cacheWrite = safeTokenCount(cacheWriteTokens);
+  if (input + output + cacheRead + cacheWrite <= 0) {
+    return null;
+  }
+  const pricing = matchModelPricing(modelName);
+  const totalUsd =
+    (input * pricing.input +
+      cacheRead * pricing.cacheRead +
+      cacheWrite * pricing.cacheWrite +
+      output * pricing.output) /
+    1_000_000;
+  if (!Number.isFinite(totalUsd) || totalUsd < 0) {
+    return null;
+  }
+  return {
+    totalUsd,
+    subagentUsd: 0,
+    estimated: true,
+  };
+}
+
+function detailedUsageEntry(msg, rowModel, rowModelId) {
+  if (!msg) {
+    return null;
+  }
+  const input = number(msg, 2);
+  const cacheWrite = number(msg, 4);
+  const cacheRead = number(msg, 5);
+  const reasoning = number(msg, 9);
+  const visible = number(msg, 10);
+  const totalOutput = Math.max(number(msg, 3), reasoning + visible);
+  if (input + totalOutput + cacheWrite + cacheRead <= 0) {
+    return null;
+  }
+  const modelId = number(msg, 1) || rowModelId || 0;
+  const model = MODEL_ID_MAP[modelId] || rowModel || "";
+  const id = text(msg, 11) || text(msg, 12) || text(msg, 7);
+  return { input, totalOutput, cacheWrite, cacheRead, model, id };
+}
+
+function isPrimaryMirror(primary, retry) {
+  if (!primary || !retry) {
+    return false;
+  }
+  return (
+    primary.input === retry.input &&
+    primary.totalOutput === retry.totalOutput &&
+    primary.cacheWrite === retry.cacheWrite &&
+    primary.cacheRead === retry.cacheRead &&
+    (!retry.id || retry.id === primary.id)
+  );
+}
+
+// Per-session USD estimate from one conversation SQLite database, accounting
+// for uncached input, cache read/write, and total (visible + thinking) output
+// tokens per turn with ccusage-compatible deduplication.
+function readSessionCostDatabase(file, fallbackModelName) {
+  const mod = loadSqlite();
+  if (!mod?.DatabaseSync) {
+    return null;
+  }
+  const db = new mod.DatabaseSync(file, { readOnly: true });
+  stats.opens += 1;
+  try {
+    const tables = new Set(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map((row) => row.name)
+    );
+    if (!tables.has("gen_metadata")) {
+      throw new Error("no gen_metadata table");
+    }
+
+    const entries = [];
+    const pushWithRetries = (primary, retries) => {
+      if (primary) {
+        entries.push(primary);
+      }
+      let droppedMirror = false;
+      for (const retry of retries) {
+        if (!retry) {
+          continue;
+        }
+        if (!droppedMirror && isPrimaryMirror(primary, retry)) {
+          droppedMirror = true;
+          continue;
+        }
+        entries.push(retry);
+      }
+    };
+
+    for (const row of db.prepare("SELECT idx, data FROM gen_metadata ORDER BY idx ASC").all()) {
+      const data = blob(row.data);
+      if (!data) {
+        continue;
+      }
+      const chat = child(decodeMessage(data), 1);
+      if (!chat) {
+        continue;
+      }
+      const rowModel = text(chat, 19) || text(chat, 21);
+      const rowModelId = number(chat, 3);
+      const primary = detailedUsageEntry(child(chat, 4), rowModel, rowModelId);
+      const retries = nested(chat, 17).map((r) =>
+        detailedUsageEntry(child(r, 2), rowModel, rowModelId)
+      );
+      pushWithRetries(primary, retries);
+    }
+
+    if (tables.has("steps")) {
+      for (const row of db.prepare("SELECT idx, metadata FROM steps ORDER BY idx ASC").all()) {
+        const data = blob(row.metadata);
+        if (!data) {
+          continue;
+        }
+        const step = decodeMessage(data);
+        const modelInfo = child(step, 24);
+        const rowModel = text(modelInfo, 12) || text(modelInfo, 8);
+        const rowModelId = number(modelInfo, 1);
+        const primary = detailedUsageEntry(child(step, 9), rowModel, rowModelId);
+        const retries = nested(step, 28).map((r) =>
+          detailedUsageEntry(child(r, 2), rowModel, rowModelId)
+        );
+        pushWithRetries(primary, retries);
+      }
+    }
+
+    const mergedById = new Map();
+    const anonymous = [];
+    for (const entry of entries) {
+      if (!entry.id) {
+        anonymous.push(entry);
+        continue;
+      }
+      const prev = mergedById.get(entry.id);
+      if (!prev) {
+        mergedById.set(entry.id, { ...entry });
+      } else {
+        prev.input = Math.max(prev.input, entry.input);
+        prev.totalOutput = Math.max(prev.totalOutput, entry.totalOutput);
+        prev.cacheWrite = Math.max(prev.cacheWrite, entry.cacheWrite);
+        prev.cacheRead = Math.max(prev.cacheRead, entry.cacheRead);
+        if (!prev.model && entry.model) {
+          prev.model = entry.model;
+        }
+      }
+    }
+
+    let totalUsd = 0;
+    let hasTokens = false;
+    for (const entry of [...mergedById.values(), ...anonymous]) {
+      const part = estimateCostFromTokens(
+        entry.model || fallbackModelName,
+        entry.input,
+        entry.totalOutput,
+        entry.cacheRead,
+        entry.cacheWrite
+      );
+      if (part) {
+        totalUsd += part.totalUsd;
+        hasTokens = true;
+      }
+    }
+
+    return hasTokens ? { totalUsd, subagentUsd: 0, estimated: true } : null;
+  } finally {
+    db.close();
+  }
+}
+
+function sessionCostCachePath() {
+  try {
+    const { getConfigDir } = require("./config");
+    const dir = getConfigDir();
+    return dir && fs.existsSync(path.join(dir, "statusline.config.json"))
+      ? path.join(dir, SESSION_COST_CACHE_NAME)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readSessionCostCache(file) {
+  let data = sessionCostMemoryCache;
+  if (file) {
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      data = null;
+    }
+  }
+  const files = {};
+  if (data?.files && typeof data.files === "object") {
+    for (const [key, entry] of Object.entries(data.files)) {
+      if (
+        /^[0-9a-f]{16}$/.test(key) &&
+        Number.isFinite(entry?.mtimeMs) &&
+        Number.isFinite(entry?.size) &&
+        typeof entry?.model === "string" &&
+        (entry.totalUsd === null || (Number.isFinite(entry.totalUsd) && entry.totalUsd >= 0))
+      ) {
+        files[key] = entry;
+      }
+    }
+  }
+  return { files };
+}
+
+function saveSessionCostCache(file, cache) {
+  sessionCostMemoryCache = cache;
+  if (!file) {
+    return;
+  }
+  try {
+    writeFileAtomic(file, JSON.stringify(cache), { mode: PRIVATE_FILE_MODE });
+  } catch {
+    // Best effort: the next refresh reads the database again.
+  }
+}
+
+function extractConversationId(data) {
+  for (const raw of [data?.conversation_id, data?.session_id]) {
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      if (CONVERSATION_ID_PATTERN.test(trimmed)) {
+        return trimmed;
+      }
+    }
+  }
+  if (typeof data?.transcript_path === "string") {
+    const base = path.basename(data.transcript_path).replace(/\.[^.]+$/, "");
+    if (CONVERSATION_ID_PATTERN.test(base)) {
+      return base;
+    }
+    const match = data.transcript_path.match(
+      /[\\/]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[\\/]/i
+    );
+    if (match) {
+      return match[1];
+    }
+  }
+  return "";
+}
+
+function resolveSessionCost(data, fallbackModelName, { read = false } = {}) {
+  if (!read || !usageAvailable()) {
+    return null;
+  }
+  const id = extractConversationId(data);
+  if (!id) {
+    return null;
+  }
+  const file = path.join(conversationsDir(), `${id}.db`);
+  const sig = signature(file);
+  if (!sig) {
+    return null;
+  }
+
+  const key = fileKey(file);
+  const modelKey = String(fallbackModelName || "");
+  const cacheFile = sessionCostCachePath();
+  const cache = readSessionCostCache(cacheFile);
+  const old = cache.files[key];
+  if (old && old.mtimeMs === sig.mtimeMs && old.size === sig.size && old.model === modelKey) {
+    return old.totalUsd === null
+      ? null
+      : { totalUsd: old.totalUsd, subagentUsd: 0, estimated: true };
+  }
+
+  try {
+    const cost = readSessionCostDatabase(file, fallbackModelName);
+    cache.files[key] = { ...sig, model: modelKey, totalUsd: cost ? cost.totalUsd : null };
+    // Keep only recent entries so the cache stays tiny.
+    const keys = Object.keys(cache.files);
+    if (keys.length > 32) {
+      keys
+        .sort((a, b) => cache.files[a].mtimeMs - cache.files[b].mtimeMs)
+        .slice(0, keys.length - 32)
+        .forEach((k) => delete cache.files[k]);
+    }
+    saveSessionCostCache(cacheFile, cache);
+    return cost;
+  } catch (err) {
+    const code = typeof err?.code === "string" && /^[A-Z_]{1,40}$/.test(err.code) ? err.code : "";
+    logWarning("USAGE_DB_UNREADABLE", code ? { code } : {});
+    if (old && old.totalUsd !== null) {
+      return { totalUsd: old.totalUsd, subagentUsd: 0, estimated: true };
+    }
+    return null;
+  }
+}
+
 function clearUsageCache() {
   memoryCache = null;
+  sessionCostMemoryCache = null;
 }
 
 module.exports = {
   USAGE_CACHE_NAME,
+  SESSION_COST_CACHE_NAME,
   USAGE_PERIODS,
   READ_BUDGET_MS,
+  MODEL_PRICING,
   stats,
   loadSqlite,
   usageAvailable,
@@ -523,6 +899,9 @@ module.exports = {
   dayKey,
   recentDays,
   conversationsDir,
+  estimateCostFromTokens,
+  readSessionCostDatabase,
+  resolveSessionCost,
   resolveUsage,
   clearUsageCache,
 };
