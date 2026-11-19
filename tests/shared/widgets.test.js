@@ -1346,6 +1346,53 @@ function testAntigravityLatestPayloadFields() {
       JSON.stringify({ costOut, estOut, microOut, hiddenCost })
     );
 
+    const estimatedFromTokens = render(
+      {
+        ...real,
+        cost: undefined,
+        model: { id: "gemini-4-neon-high", display_name: "Gemini 4 Neon (High)" },
+        context_window: {
+          ...real.context_window,
+          total_input_tokens: 18669,
+          total_output_tokens: 52,
+        },
+      },
+      [{ id: "cost", estimate: true }],
+      { layout }
+    );
+    const reportedBeatsEstimate = render(
+      {
+        ...real,
+        cost: { total_cost_usd: 0.25, estimated: false },
+        model: { id: "gemini-4-neon-high", display_name: "Gemini 4 Neon (High)" },
+      },
+      [{ id: "cost", estimate: true }],
+      { layout }
+    );
+    const zeroTokensEstimate = render(
+      {
+        ...real,
+        cost: undefined,
+        context_window: {
+          context_window_size: 1048576,
+          used_percentage: 0,
+          total_input_tokens: 0,
+          total_output_tokens: 0,
+          current_usage: null,
+        },
+      },
+      [{ id: "cost", estimate: true }],
+      { layout }
+    );
+    record(
+      `${layout} cost estimate option falls back to token pricing, yields to reported cost, and hides at 0 tokens`,
+      estimatedFromTokens.includes("~$0.06") &&
+        reportedBeatsEstimate.includes("$0.25") &&
+        !reportedBeatsEstimate.includes("~$") &&
+        zeroTokensEstimate.trim() === "",
+      JSON.stringify({ estimatedFromTokens, reportedBeatsEstimate, zeroTokensEstimate })
+    );
+
     const agentOut = render({ ...real, agent: { name: "security-reviewer" } }, [{ id: "agent" }], {
       layout,
     });

@@ -576,7 +576,8 @@ function buildSegment(id, session, colors, emojis, ascii = false, widget = {}, c
       );
 
     case "cost": {
-      const text = formatCost(session.cost);
+      const effectiveCost = session.cost || (widget?.estimate ? session.estimatedCost : null);
+      const text = formatCost(effectiveCost);
       if (!text) {
         return null;
       }

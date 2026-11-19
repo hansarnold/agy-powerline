@@ -194,6 +194,11 @@ function buildConfigSchema() {
           format: { enum: ["countdown", "time", "both"], description: "Reset widgets." },
           short: { type: "boolean", description: "model: the short model name." },
           split: { type: "boolean", description: "Token widgets: input and output apart." },
+          estimate: {
+            type: "boolean",
+            description:
+              "cost: estimate USD spend from session tokens and model list prices when cost is omitted.",
+          },
           budget: { type: "number", minimum: 1, description: "tokensToday / tokensWeek." },
           text: { type: "string", description: "customText: the text to show." },
         },

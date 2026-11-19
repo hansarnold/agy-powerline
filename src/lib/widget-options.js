@@ -290,6 +290,15 @@ function editFields(widget, config = {}, options = {}) {
       help: "Adds how far usage is ahead of (⇡) or behind (⇣) an even pace over the window, in points.",
     });
   }
+  if (widget.id === "cost") {
+    fields.push({
+      key: "estimate",
+      label: "Estimate from tokens",
+      values: [undefined, true],
+      show: (value) => (value ? "on" : "off (payload only)"),
+      help: "Estimates session spend from model list prices and session tokens when Antigravity omits cost (e.g. subscription plans).",
+    });
+  }
   return fields;
 }
 
