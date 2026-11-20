@@ -30,6 +30,8 @@ const MAX_BLOB_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 8;
 const DAY_KEY = /^\d{4}-\d{2}-\d{2}$/;
 const CONVERSATION_ID_PATTERN = /^[0-9a-f-]{8,64}$/i;
+const MAX_DESCENDANT_CONVERSATIONS = 512;
+const MAX_SESSION_COST_CACHE_FILES = 512;
 
 // Model ID mapping and token-pricing logic aligned with ccusage's Antigravity
 // adapter (MIT, rust/adapters/antigravity/src/parser.rs) and LiteLLM rates
@@ -87,6 +89,7 @@ const DEFAULT_MODEL_PRICING = { input: 2.0, output: 10.0, cacheRead: 0.1, cacheW
 const stats = { opens: 0 };
 let memoryCache = null;
 let sessionCostMemoryCache = null;
+let summariesMemoryCache = null;
 let sqlite;
 
 // node:sqlite is built into Node 22.13 / 23.4 and newer. Node 22 prints an
@@ -833,6 +836,163 @@ function extractConversationId(data) {
   return "";
 }
 
+function conversationSummariesPath() {
+  return path.join(os.homedir(), ".gemini", "antigravity-cli", "conversation_summaries.db");
+}
+
+function addParentEdge(childrenByParent, parentId, childId) {
+  if (
+    typeof parentId !== "string" ||
+    typeof childId !== "string" ||
+    !CONVERSATION_ID_PATTERN.test(parentId) ||
+    !CONVERSATION_ID_PATTERN.test(childId) ||
+    parentId === childId
+  ) {
+    return;
+  }
+  let children = childrenByParent.get(parentId);
+  if (!children) {
+    children = new Set();
+    childrenByParent.set(parentId, children);
+  }
+  children.add(childId);
+}
+
+// Reads parent -> child conversation links (subagents and swarm workers) from
+// agy's conversation_summaries.db, caching the map in memory until the file or
+// its -wal changes.
+function readConversationChildrenMap() {
+  const summariesFile = conversationSummariesPath();
+  const sig = signature(summariesFile);
+  if (!sig) {
+    return null;
+  }
+  if (
+    summariesMemoryCache &&
+    summariesMemoryCache.file === summariesFile &&
+    summariesMemoryCache.mtimeMs === sig.mtimeMs &&
+    summariesMemoryCache.size === sig.size
+  ) {
+    return summariesMemoryCache.childrenByParent;
+  }
+
+  const mod = loadSqlite();
+  if (!mod?.DatabaseSync) {
+    return null;
+  }
+  let db;
+  try {
+    db = new mod.DatabaseSync(summariesFile, { readOnly: true });
+    stats.opens += 1;
+    const tables = new Set(
+      db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map((row) => row.name)
+    );
+    const childrenByParent = new Map();
+    if (tables.has("conversation_summaries")) {
+      const cols = new Set(
+        db
+          .prepare("PRAGMA table_info(conversation_summaries)")
+          .all()
+          .map((row) => row.name)
+      );
+      if (cols.has("conversation_id") && cols.has("parent_conversation_id")) {
+        for (const row of db
+          .prepare(
+            "SELECT conversation_id, parent_conversation_id " +
+              "FROM conversation_summaries WHERE parent_conversation_id != ''"
+          )
+          .all()) {
+          addParentEdge(childrenByParent, row.parent_conversation_id, row.conversation_id);
+        }
+      }
+    }
+    if (tables.has("conversation_parents")) {
+      const cols = new Set(
+        db
+          .prepare("PRAGMA table_info(conversation_parents)")
+          .all()
+          .map((row) => row.name)
+      );
+      if (cols.has("conversation_id") && cols.has("parent_id")) {
+        for (const row of db
+          .prepare(
+            "SELECT conversation_id, parent_id FROM conversation_parents WHERE parent_id != ''"
+          )
+          .all()) {
+          addParentEdge(childrenByParent, row.parent_id, row.conversation_id);
+        }
+      }
+    }
+    summariesMemoryCache = {
+      file: summariesFile,
+      mtimeMs: sig.mtimeMs,
+      size: sig.size,
+      childrenByParent,
+    };
+    return childrenByParent;
+  } catch (err) {
+    const code = typeof err?.code === "string" && /^[A-Z_]{1,40}$/.test(err.code) ? err.code : "";
+    logWarning("USAGE_DB_UNREADABLE", code ? { code } : {});
+    return summariesMemoryCache?.file === summariesFile
+      ? summariesMemoryCache.childrenByParent
+      : null;
+  } finally {
+    if (db) {
+      db.close();
+    }
+  }
+}
+
+function readDescendantConversationIds(rootId) {
+  const childrenByParent = readConversationChildrenMap();
+  if (!childrenByParent) {
+    return [];
+  }
+  const visited = new Set([rootId]);
+  const queue = [rootId];
+  const descendants = [];
+  while (queue.length > 0 && descendants.length < MAX_DESCENDANT_CONVERSATIONS) {
+    const current = queue.shift();
+    const children = childrenByParent.get(current);
+    if (!children) {
+      continue;
+    }
+    for (const childId of children) {
+      if (visited.has(childId)) {
+        continue;
+      }
+      visited.add(childId);
+      descendants.push(childId);
+      if (descendants.length >= MAX_DESCENDANT_CONVERSATIONS) {
+        break;
+      }
+      queue.push(childId);
+    }
+  }
+  return descendants;
+}
+
+function readCachedConversationCost(file, sig, fallbackModelName, modelKey, cache) {
+  const key = fileKey(file);
+  const old = cache.files[key];
+  if (old && old.mtimeMs === sig.mtimeMs && old.size === sig.size && old.model === modelKey) {
+    return { key, totalUsd: old.totalUsd, hit: true, changed: false };
+  }
+  try {
+    const cost = readSessionCostDatabase(file, fallbackModelName);
+    const totalUsd = cost ? cost.totalUsd : null;
+    cache.files[key] = { ...sig, model: modelKey, totalUsd };
+    return { key, totalUsd, hit: false, changed: true };
+  } catch (err) {
+    const code = typeof err?.code === "string" && /^[A-Z_]{1,40}$/.test(err.code) ? err.code : "";
+    logWarning("USAGE_DB_UNREADABLE", code ? { code } : {});
+    return { key, totalUsd: old ? old.totalUsd : null, hit: false, changed: false };
+  }
+}
+
 function resolveSessionCost(data, fallbackModelName, { read = false } = {}) {
   if (!read || !usageAvailable()) {
     return null;
@@ -841,49 +1001,110 @@ function resolveSessionCost(data, fallbackModelName, { read = false } = {}) {
   if (!id) {
     return null;
   }
-  const file = path.join(conversationsDir(), `${id}.db`);
-  const sig = signature(file);
-  if (!sig) {
+  const convDir = conversationsDir();
+  const mainFile = path.join(convDir, `${id}.db`);
+  const mainSig = signature(mainFile);
+  const descendantIds = readDescendantConversationIds(id);
+  if (!mainSig && descendantIds.length === 0) {
     return null;
   }
 
-  const key = fileKey(file);
+  const startedAt = Date.now();
   const modelKey = String(fallbackModelName || "");
   const cacheFile = sessionCostCachePath();
   const cache = readSessionCostCache(cacheFile);
-  const old = cache.files[key];
-  if (old && old.mtimeMs === sig.mtimeMs && old.size === sig.size && old.model === modelKey) {
-    return old.totalUsd === null
-      ? null
-      : { totalUsd: old.totalUsd, subagentUsd: 0, estimated: true };
+  const activeKeys = new Set();
+  let cacheChanged = false;
+  let hasTokens = false;
+  let mainUsd = 0;
+  let subagentUsd = 0;
+
+  if (mainSig) {
+    const mainResult = readCachedConversationCost(
+      mainFile,
+      mainSig,
+      fallbackModelName,
+      modelKey,
+      cache
+    );
+    activeKeys.add(mainResult.key);
+    cacheChanged = cacheChanged || mainResult.changed;
+    if (mainResult.totalUsd !== null) {
+      mainUsd = mainResult.totalUsd;
+      hasTokens = true;
+    }
   }
 
-  try {
-    const cost = readSessionCostDatabase(file, fallbackModelName);
-    cache.files[key] = { ...sig, model: modelKey, totalUsd: cost ? cost.totalUsd : null };
-    // Keep only recent entries so the cache stays tiny.
+  const staleDescendants = [];
+  for (const childId of descendantIds) {
+    const childFile = path.join(convDir, `${childId}.db`);
+    const childSig = signature(childFile);
+    if (!childSig) {
+      continue;
+    }
+    const key = fileKey(childFile);
+    activeKeys.add(key);
+    const old = cache.files[key];
+    if (
+      old &&
+      old.mtimeMs === childSig.mtimeMs &&
+      old.size === childSig.size &&
+      old.model === modelKey
+    ) {
+      if (old.totalUsd !== null) {
+        subagentUsd += old.totalUsd;
+        hasTokens = true;
+      }
+      continue;
+    }
+    staleDescendants.push({ file: childFile, sig: childSig, old });
+  }
+
+  // Update the most recently modified workers first if a large swarm exceeds
+  // the per-refresh read budget; the rest are picked up on following refreshes.
+  staleDescendants.sort((a, b) => b.sig.mtimeMs - a.sig.mtimeMs);
+  for (const item of staleDescendants) {
+    if (Date.now() - startedAt > READ_BUDGET_MS) {
+      if (item.old && item.old.totalUsd !== null) {
+        subagentUsd += item.old.totalUsd;
+        hasTokens = true;
+      }
+      continue;
+    }
+    const childResult = readCachedConversationCost(
+      item.file,
+      item.sig,
+      fallbackModelName,
+      modelKey,
+      cache
+    );
+    cacheChanged = cacheChanged || childResult.changed;
+    if (childResult.totalUsd !== null) {
+      subagentUsd += childResult.totalUsd;
+      hasTokens = true;
+    }
+  }
+
+  if (cacheChanged) {
+    const maxEntries = Math.max(MAX_SESSION_COST_CACHE_FILES, activeKeys.size);
     const keys = Object.keys(cache.files);
-    if (keys.length > 32) {
+    if (keys.length > maxEntries) {
       keys
+        .filter((k) => !activeKeys.has(k))
         .sort((a, b) => cache.files[a].mtimeMs - cache.files[b].mtimeMs)
-        .slice(0, keys.length - 32)
+        .slice(0, keys.length - maxEntries)
         .forEach((k) => delete cache.files[k]);
     }
     saveSessionCostCache(cacheFile, cache);
-    return cost;
-  } catch (err) {
-    const code = typeof err?.code === "string" && /^[A-Z_]{1,40}$/.test(err.code) ? err.code : "";
-    logWarning("USAGE_DB_UNREADABLE", code ? { code } : {});
-    if (old && old.totalUsd !== null) {
-      return { totalUsd: old.totalUsd, subagentUsd: 0, estimated: true };
-    }
-    return null;
   }
+
+  return hasTokens ? { totalUsd: mainUsd + subagentUsd, subagentUsd, estimated: true } : null;
 }
 
 function clearUsageCache() {
   memoryCache = null;
   sessionCostMemoryCache = null;
+  summariesMemoryCache = null;
 }
 
 module.exports = {
@@ -899,6 +1120,7 @@ module.exports = {
   dayKey,
   recentDays,
   conversationsDir,
+  conversationSummariesPath,
   estimateCostFromTokens,
   readSessionCostDatabase,
   resolveSessionCost,

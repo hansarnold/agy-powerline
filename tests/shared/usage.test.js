@@ -12,10 +12,12 @@ const { getConfigDir, setConfigDir } = require("../../src/lib/config");
 const { setLogDir, readLog, getLogPath } = require("../../src/lib/log");
 const {
   USAGE_CACHE_NAME,
+  SESSION_COST_CACHE_NAME,
   stats,
   loadSqlite,
   decodeMessage,
   readSessionCostDatabase,
+  resolveSessionCost,
   clearUsageCache,
 } = require("../../src/lib/usage");
 
@@ -419,6 +421,139 @@ async function run() {
         opensAfterCost2: stats.opens,
       })
     );
+
+    // Swarm workers and nested subagents linked via conversation_summaries.db.
+    const workerConvId = "22222222-2222-3333-4444-555555555555";
+    const helperConvId = "33333333-2222-3333-4444-555555555555";
+    const unrelatedConvId = "44444444-2222-3333-4444-555555555555";
+    const workerDbFile = path.join(dir, `${workerConvId}.db`);
+    const helperDbFile = path.join(dir, `${helperConvId}.db`);
+    const unrelatedDbFile = path.join(dir, `${unrelatedConvId}.db`);
+    // Worker: 100K input ($0.30) + 10K output ($0.15) on Neon = $0.45.
+    makeConversationDb(workerDbFile, {
+      gens: [generator({ input: 100_000, output: 10_000, id: "resp-worker-1" }, NOW)],
+      mtime: NOW,
+    });
+    // Nested helper: 50K input ($0.15) + 10K output ($0.15) on Neon = $0.30.
+    makeConversationDb(helperDbFile, {
+      gens: [generator({ input: 50_000, output: 10_000, id: "resp-helper-1" }, NOW)],
+      mtime: NOW,
+    });
+    // Unrelated conversation: must not be added to this session.
+    makeConversationDb(unrelatedDbFile, {
+      gens: [generator({ input: 1_000_000, output: 100_000, id: "resp-other-1" }, NOW)],
+      mtime: NOW,
+    });
+    const summariesDbFile = path.join(
+      home,
+      ".gemini",
+      "antigravity-cli",
+      "conversation_summaries.db"
+    );
+    const { DatabaseSync } = loadSqlite();
+    const sdb = new DatabaseSync(summariesDbFile);
+    sdb.exec(
+      "CREATE TABLE conversation_summaries (" +
+        "conversation_id TEXT PRIMARY KEY, " +
+        "parent_conversation_id TEXT NOT NULL DEFAULT '');" +
+        "CREATE TABLE conversation_parents (" +
+        "conversation_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL);"
+    );
+    // Direct worker in conversation_summaries, nested helper in conversation_parents,
+    // plus a cycle back to root and an unrelated conversation.
+    sdb
+      .prepare("INSERT INTO conversation_summaries VALUES (?, ?)")
+      .run(workerConvId, costConvId);
+    sdb
+      .prepare("INSERT INTO conversation_summaries VALUES (?, ?)")
+      .run(costConvId, helperConvId);
+    sdb.prepare("INSERT INTO conversation_summaries VALUES (?, ?)").run(unrelatedConvId, "");
+    sdb.prepare("INSERT INTO conversation_parents VALUES (?, ?)").run(helperConvId, workerConvId);
+    sdb.close();
+    fs.utimesSync(summariesDbFile, new Date(NOW), new Date(NOW));
+
+    clearUsageCache();
+    const opensBeforeSwarm = stats.opens;
+    const swarmCost = inHome(home, () =>
+      resolveSessionCost(costPayload, "Gemini 4 Neon (High)", { read: true })
+    );
+    const opensAfterSwarm1 = stats.opens;
+    const swarmRendered = inHome(home, () =>
+      stripAnsi(renderStatusline(costPayload, costCfg, { usage: "read" }))
+    );
+    const opensAfterSwarm2 = stats.opens;
+    // Main ($0.90) + worker ($0.45) + nested helper ($0.30) = $1.65; subagentUsd = $0.75.
+    record(
+      "session cost aggregates swarm workers and nested subagents without cycles or unrelated sessions",
+      swarmCost !== null &&
+        Math.abs(swarmCost.totalUsd - 1.65) < 1e-9 &&
+        Math.abs(swarmCost.subagentUsd - 0.75) < 1e-9 &&
+        swarmRendered.includes("~$1.65") &&
+        opensAfterSwarm2 === opensAfterSwarm1 &&
+        opensAfterSwarm1 > opensBeforeSwarm,
+      JSON.stringify({
+        swarmCost,
+        swarmRendered,
+        opensBeforeSwarm,
+        opensAfterSwarm1,
+        opensAfterSwarm2,
+      })
+    );
+
+    // Updating one worker DB reopens only that worker DB and updates the total.
+    fs.rmSync(workerDbFile, { force: true });
+    makeConversationDb(workerDbFile, {
+      gens: [
+        generator({ input: 100_000, output: 10_000, id: "resp-worker-1" }, NOW),
+        generator({ input: 100_000, output: 10_000, id: "resp-worker-2" }, NOW + 1000),
+      ],
+      mtime: NOW + 1000,
+    });
+    const opensBeforeWorkerUpdate = stats.opens;
+    const updatedSwarmCost = inHome(home, () =>
+      resolveSessionCost(costPayload, "Gemini 4 Neon (High)", { read: true })
+    );
+    const sessionCostCacheText = fs.readFileSync(
+      path.join(install, SESSION_COST_CACHE_NAME),
+      "utf8"
+    );
+    record(
+      "updating one swarm worker reopens only that DB and keeps conversation IDs out of the cache",
+      updatedSwarmCost !== null &&
+        Math.abs(updatedSwarmCost.totalUsd - 2.1) < 1e-9 &&
+        Math.abs(updatedSwarmCost.subagentUsd - 1.2) < 1e-9 &&
+        stats.opens === opensBeforeWorkerUpdate + 1 &&
+        !sessionCostCacheText.includes(costConvId) &&
+        !sessionCostCacheText.includes(workerConvId) &&
+        !sessionCostCacheText.includes(helperConvId),
+      JSON.stringify({
+        updatedSwarmCost,
+        opensDelta: stats.opens - opensBeforeWorkerUpdate,
+      })
+    );
+
+    // Corrupt conversation_summaries.db falls back to main session cost without leaking IDs.
+    setLogDir(install, true);
+    try {
+      fs.writeFileSync(summariesDbFile, "not a sqlite database");
+      fs.utimesSync(summariesDbFile, new Date(NOW + 2000), new Date(NOW + 2000));
+      clearUsageCache();
+      const fallbackCost = inHome(home, () =>
+        resolveSessionCost(costPayload, "Gemini 4 Neon (High)", { read: true })
+      );
+      const logText = fs.readFileSync(getLogPath(), "utf8");
+      record(
+        "corrupt conversation_summaries.db falls back to main session cost safely",
+        fallbackCost !== null &&
+          Math.abs(fallbackCost.totalUsd - 0.9) < 1e-9 &&
+          fallbackCost.subagentUsd === 0 &&
+          !logText.includes("conversation_summaries") &&
+          !logText.includes(costConvId),
+        JSON.stringify(fallbackCost)
+      );
+    } finally {
+      setLogDir(null);
+    }
   } catch (err) {
     record("usage suite ran without errors", false, String(err.stack || err));
   } finally {
